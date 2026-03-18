@@ -1,0 +1,140 @@
+name: MLOps Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_all: 
+        description: 'Run the entire MLOps pipeline'
+        required: false
+        default: 'true'
+  push:
+    branches: [ main ]
+  release:
+    types: [created]
+    tags: [ 'v*.*.*' ]
+
+jobs:
+  data_processing: 
+    runs-on: ubuntu-latest
+    steps: 
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11.9"
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Process data 
+      run: |
+        python src/data/run_processing.py \
+        --input data/raw/house_data.csv \
+        --output data/processed/cleaned_house_data.csv
+
+    - name: Engineer features 
+      run: |
+        python src/features/engineer.py \
+        --input data/processed/cleaned_house_data.csv \
+        --output data/processed/featured_house_data.csv \
+        --preprocessor models/trained/preprocessor.pkl
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: data-and-preprocessor
+        path: |
+          data/processed/featured_house_data.csv
+          models/trained/preprocessor.pkl
+
+  model_training:
+    needs: data_processing
+    runs-on: ubuntu-latest
+    steps: 
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11.9"
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Download Processed Data
+      uses: actions/download-artifact@v4
+      with:
+        name: data-and-preprocessor
+        path: .
+
+    - name: Setup MLflow Server 
+      run: |
+        docker pull ghcr.io/mlflow/mlflow:latest
+        docker run -d -p 5555:5000 --name MLflow-Server ghcr.io/mlflow/mlflow:latest \
+        mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db 
+
+    - name: Wait for MLflow
+      run: sleep 10
+
+    - name: Train Model
+      run: |
+        python src/models/train_model.py \
+        --config configs/model_config.yaml \
+        --data data/processed/featured_house_data.csv \
+        --models-dir models \
+        --mlflow-tracking-uri http://localhost:5555
+    
+    - name: Upload Trained Model
+      uses: actions/upload-artifact@v4
+      with:
+        name: trained-model
+        path: models/ 
+
+    - name: Cleanup MLflow
+      run: docker stop MLflow-Server && docker rm MLflow-Server
+    
+  build_and_publish:
+    needs: model_training
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: .
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Build, Test, and Push
+        run: |
+          # 1. Generate short SHA
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE_NAME=docker.io/${{ secrets.DOCKER_USERNAME }}/house-price-predictor
+          
+          # 2. Build image
+          docker build -t ${IMAGE_NAME}:${SHORT_SHA} -f Dockerfile .
+          
+          # 3. Test container
+          docker run -d -p 8000:8000 --name test-api ${IMAGE_NAME}:${SHORT_SHA}
+          sleep 10
+          curl -f http://localhost:8000/health || (docker logs test-api && exit 1)
+          docker stop test-api && docker rm test-api
+          
+          # 4. Tag and Push
+          docker tag ${IMAGE_NAME}:${SHORT_SHA} ${IMAGE_NAME}:latest
+          docker push ${IMAGE_NAME}:${SHORT_SHA}
+          docker push ${IMAGE_NAME}:latest
